@@ -1,46 +1,137 @@
 
 import os
 import json
+import re
+import time
+from pathlib import Path
+
 import requests
+
+# =====================================================
+# PROFESSOR PUTRICIDE - WORLD OF WARCRAFT: FOREVER
+# =====================================================
 
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 SOURCE_CHANNEL = os.environ["SOURCE_CHANNEL_ID"]
 TARGET_CHANNEL = os.environ["TARGET_CHANNEL_ID"]
+GUILD_ID = os.environ["GUILD_ID"]
 
 DISCORD_API = "https://discord.com/api/v10"
-GEMINI_MODEL = "gemini-2.5-flash-lite"
-STATE_FILE = "state.json"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
-HEADERS = {
+STATE_FILE = Path("state.json")
+
+DISCORD_HEADERS = {
     "Authorization": f"Bot {DISCORD_TOKEN}",
     "Content-Type": "application/json"
 }
 
 
+# =====================================================
+# STATE - EVIDENCE ZPRACOVANYCH ZPRAV
+# =====================================================
+
 def load_state():
-    if not os.path.exists(STATE_FILE):
+    if not STATE_FILE.exists():
         return {"last_message_id": None}
 
-    with open(STATE_FILE, "r", encoding="utf-8") as file:
+    with STATE_FILE.open("r", encoding="utf-8") as file:
         return json.load(file)
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as file:
+    temporary_file = STATE_FILE.with_suffix(".tmp")
+
+    with temporary_file.open("w", encoding="utf-8") as file:
         json.dump(state, file, indent=2)
 
+    temporary_file.replace(STATE_FILE)
 
-def get_messages():
-    response = requests.get(
+
+# =====================================================
+# DISCORD API
+# =====================================================
+
+def discord_request(method, url, **kwargs):
+    for attempt in range(5):
+        response = requests.request(
+            method,
+            url,
+            headers=DISCORD_HEADERS,
+            timeout=30,
+            **kwargs
+        )
+
+        if response.status_code == 429:
+            delay = response.json().get("retry_after", 2)
+            time.sleep(float(delay) + 0.5)
+            continue
+
+        if response.status_code >= 500:
+            time.sleep(2 ** attempt)
+            continue
+
+        response.raise_for_status()
+        return response
+
+    raise RuntimeError("Discord API opakovaně selhalo.")
+
+
+def get_latest_message():
+    response = discord_request(
+        "GET",
         f"{DISCORD_API}/channels/{SOURCE_CHANNEL}/messages",
-        headers=HEADERS,
-        params={"limit": 100},
-        timeout=30
+        params={"limit": 1}
     )
-    response.raise_for_status()
-    return response.json()
 
+    messages = response.json()
+    return messages[0] if messages else None
+
+
+def get_new_messages(last_message_id):
+    collected = []
+    before_id = None
+
+    while True:
+        params = {"limit": 100}
+
+        if before_id:
+            params["before"] = before_id
+
+        response = discord_request(
+            "GET",
+            f"{DISCORD_API}/channels/{SOURCE_CHANNEL}/messages",
+            params=params
+        )
+
+        batch = response.json()
+
+        if not batch:
+            break
+
+        collected.extend(batch)
+        oldest_id = batch[-1]["id"]
+
+        if int(oldest_id) <= int(last_message_id):
+            break
+
+        if len(batch) < 100:
+            break
+
+        before_id = oldest_id
+
+    new_messages = [
+        message for message in collected
+        if int(message["id"]) > int(last_message_id)
+    ]
+
+    return sorted(new_messages, key=lambda m: int(m["id"]))
+
+
+# =====================================================
+# EXTRACT PATCH NOTES
+# =====================================================
 
 def extract_content(message):
     parts = []
@@ -56,57 +147,85 @@ def extract_content(message):
         if embed.get("description"):
             parts.append(embed["description"])
 
-        for field in embed.get("fields", []):
-            parts.append(
-                f"{field.get('name', '')}: {field.get('value', '')}"
-            )
-
         if embed.get("url"):
             source_url = embed["url"]
+
+        for field in embed.get("fields", []):
+            name = field.get("name", "")
+            value = field.get("value", "")
+            parts.append(f"{name}: {value}")
+
+    original_text = "\n\n".join(parts).strip()
+
+    if not source_url:
+        urls = re.findall(r"https?://\S+", original_text)
+        if urls:
+            source_url = urls[0].rstrip(").,]")
 
     if not source_url:
         source_url = (
             f"https://discord.com/channels/"
-            f"{message['guild_id']}/"
-            f"{SOURCE_CHANNEL}/{message['id']}"
+            f"{GUILD_ID}/{SOURCE_CHANNEL}/{message['id']}"
         )
 
-    return "\n\n".join(parts).strip(), source_url
+    return original_text, source_url
 
 
-def summarize(text):
+# =====================================================
+# GEMINI AI - CZECH SUMMARY
+# =====================================================
+
+def summarize_with_ai(original_text):
     prompt = f"""
-You are Professor Putricide from World of Warcraft.
+Jsi Professor Putricide ze světa World of Warcraft.
 
-Create a concise and accurate Czech summary of these
-World of Warcraft: Forever patch notes.
+Tvým úkolem je vytvořit přesné a stručné české shrnutí
+oficiálních patch notes pro World of Warcraft: Forever.
 
-Rules:
-- Start with 🧪 GOOD NEWS, EVERYONE!
-- Write entirely in Czech except official game terminology.
-- Preserve English names of spells, items, talents and classes.
-- Organize changes into clear categories.
-- Highlight important gameplay changes.
-- Never invent information.
-- Include only changes explicitly stated in the source.
-- Use clean Discord Markdown.
-- Keep the summary concise.
+PRAVIDLA:
 
-ORIGINAL PATCH NOTES:
+1. Začni přesně:
+🧪 GOOD NEWS, EVERYONE!
 
-{text}
+2. Piš česky.
+3. Názvy class, spellů, talentů, předmětů a herních
+   mechanik ponechávej v originální angličtině.
+4. Rozděl změny do přehledných kategorií.
+5. Zvýrazni důležité změny balancování, opravy bugů,
+   změny dungeonů, raidů a předmětů.
+6. Nevymýšlej žádné informace.
+7. Pokud je informace neúplná, nepokoušej se ji domýšlet.
+8. Neopakuj zbytečně stejnou informaci.
+9. Používej přehledný Discord Markdown.
+10. Zachovej přesné číselné hodnoty změn.
+11. Pokud oznámení neobsahuje důležité změny, stručně
+    popiš jeho skutečný obsah.
+
+Styl:
+Professor Putricide, lehce šílený laboratorní humor,
+ale především přehlednost a technická přesnost.
+
+ORIGINÁLNÍ PATCH NOTES:
+
+<patch_notes>
+{original_text}
+</patch_notes>
 """
 
     response = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent",
+        f"https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{GEMINI_MODEL}:generateContent",
         headers={
             "x-goog-api-key": GEMINI_KEY,
             "Content-Type": "application/json"
         },
         json={
             "contents": [
-                {"parts": [{"text": prompt}]}
+                {
+                    "parts": [
+                        {"text": prompt}
+                    ]
+                }
             ],
             "generationConfig": {
                 "temperature": 0.2,
@@ -119,78 +238,128 @@ ORIGINAL PATCH NOTES:
     response.raise_for_status()
     data = response.json()
 
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    candidates = data.get("candidates", [])
+
+    if not candidates:
+        raise RuntimeError("Gemini nevrátil žádné shrnutí.")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+
+    result = "".join(
+        part.get("text", "")
+        for part in parts
+    ).strip()
+
+    if not result:
+        raise RuntimeError("Gemini vrátil prázdnou odpověď.")
+
+    return result
 
 
-def publish(text, source_url):
+# =====================================================
+# DISCORD PUBLICATION
+# =====================================================
+
+def split_message(text, limit=1900):
+    lines = text.splitlines()
+    chunks = []
+    current = ""
+
+    for line in lines:
+        candidate = f"{current}\n{line}" if current else line
+
+        if len(candidate) > limit:
+            if current:
+                chunks.append(current)
+            current = line[:limit]
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def publish_message(summary, source_url):
     content = (
-        f"{text}\n\n"
-        f"🔗 [Originální oznámení]({source_url})"
+        f"{summary}\n\n"
+        f"🔗 [Originální patch notes]({source_url})"
     )
 
-    chunks = [
-        content[i:i + 1900]
-        for i in range(0, len(content), 1900)
-    ]
-
-    for chunk in chunks:
-        response = requests.post(
+    for chunk in split_message(content):
+        discord_request(
+            "POST",
             f"{DISCORD_API}/channels/{TARGET_CHANNEL}/messages",
-            headers=HEADERS,
             json={
                 "content": chunk,
                 "allowed_mentions": {"parse": []}
-            },
-            timeout=30
+            }
         )
-        response.raise_for_status()
 
+
+# =====================================================
+# MAIN
+# =====================================================
 
 def main():
     state = load_state()
-    messages = get_messages()
 
-    messages.sort(key=lambda m: int(m["id"]))
+    print("🧪 Professor Putricide se probouzí...")
 
-    if state["last_message_id"] is None:
-        if messages:
-            state["last_message_id"] = messages[-1]["id"]
+    # První spuštění pouze uloží výchozí bod.
+    # Historické zprávy se nebudou publikovat.
+    if state.get("last_message_id") is None:
+        latest = get_latest_message()
+
+        if latest:
+            state["last_message_id"] = latest["id"]
             save_state(state)
 
-        print("Initial checkpoint saved. Waiting for new updates.")
+        print("Výchozí bod uložen. Čekám na nové patch notes.")
         return
 
-    last_id = int(state["last_message_id"])
+    new_messages = get_new_messages(state["last_message_id"])
 
-    new_messages = [
-        message for message in messages
-        if int(message["id"]) > last_id
-    ]
+    if not new_messages:
+        print("Žádné nové patch notes.")
+        return
 
     for message in new_messages:
+
+        # Zpracováváme pouze zprávy od botů s embedy.
         if not message.get("author", {}).get("bot"):
             state["last_message_id"] = message["id"]
             save_state(state)
             continue
 
-        original, source_url = extract_content(message)
-
-        if not original:
+        if not message.get("embeds"):
             state["last_message_id"] = message["id"]
             save_state(state)
             continue
 
-        print(f"Processing message {message['id']}")
+        original_text, source_url = extract_content(message)
 
-        summary = summarize(original)
-        publish(summary, source_url)
+        if not original_text:
+            state["last_message_id"] = message["id"]
+            save_state(state)
+            continue
 
+        print(f"Zpracovávám zprávu: {message['id']}")
+
+        # Pokud AI nebo Discord selže, zpráva zůstane
+        # nezpracovaná a při dalším spuštění se zkusí znovu.
+        summary = summarize_with_ai(original_text)
+
+        publish_message(summary, source_url)
+
+        # Posuneme stav až po úspěšném zveřejnění.
         state["last_message_id"] = message["id"]
         save_state(state)
 
-        print("Published successfully.")
+        print("GOOD NEWS, EVERYONE! Zpráva publikována.")
 
-    print("Check completed.")
+    print("Kontrola dokončena.")
 
 
 if __name__ == "__main__":
