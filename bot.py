@@ -1,419 +1,3 @@
-import os
-import json
-import time
-import re
-from pathlib import Path
-from html.parser import HTMLParser
-from urllib.parse import urlparse, unquote
-
-import requests
-
-
-# =====================================================
-# PROFESSOR PUTRICIDE - WOW FOREVER
-# =====================================================
-
-DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-SOURCE_CHANNEL = os.environ["SOURCE_CHANNEL_ID"]
-TARGET_CHANNEL = os.environ["TARGET_CHANNEL_ID"]
-GUILD_ID = os.environ["GUILD_ID"]
-
-DISCORD_API = "https://discord.com/api/v10"
-GEMINI_MODEL = "gemini-3.5-flash-lite"
-
-STATE_FILE = Path("state.json")
-
-DISCORD_HEADERS = {
-    "Authorization": f"Bot {DISCORD_TOKEN}",
-    "Content-Type": "application/json"
-}
-
-WEB_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; ProfessorPutricide/1.0)",
-    "Accept": "text/html,application/xhtml+xml"
-}
-
-session = requests.Session()
-session.headers.update(WEB_HEADERS)
-
-
-# =====================================================
-# STATE
-# =====================================================
-
-def load_state():
-    if not STATE_FILE.exists():
-        return {"last_message_id": None}
-
-    with STATE_FILE.open("r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def save_state(state):
-    temp_file = STATE_FILE.with_suffix(".tmp")
-
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(state, file, indent=2)
-
-    temp_file.replace(STATE_FILE)
-
-
-# =====================================================
-# DISCORD API
-# =====================================================
-
-def discord_request(method, url, **kwargs):
-    for attempt in range(5):
-        response = requests.request(
-            method,
-            url,
-            headers=DISCORD_HEADERS,
-            timeout=30,
-            **kwargs
-        )
-
-        if response.status_code == 429:
-            delay = response.json().get("retry_after", 2)
-            print(f"Discord rate limit. Čekám {delay} sekund.")
-            time.sleep(float(delay) + 0.5)
-            continue
-
-        if response.status_code >= 500:
-            time.sleep(2 ** attempt)
-            continue
-
-        response.raise_for_status()
-        return response
-
-    raise RuntimeError("Discord API opakovaně selhalo.")
-
-
-def get_latest_message():
-    response = discord_request(
-        "GET",
-        f"{DISCORD_API}/channels/{SOURCE_CHANNEL}/messages",
-        params={"limit": 1}
-    )
-
-    messages = response.json()
-    return messages[0] if messages else None
-
-
-def get_new_messages(last_message_id):
-    collected = []
-    before_id = None
-
-    while True:
-        params = {"limit": 100}
-
-        if before_id:
-            params["before"] = before_id
-
-        response = discord_request(
-            "GET",
-            f"{DISCORD_API}/channels/{SOURCE_CHANNEL}/messages",
-            params=params
-        )
-
-        batch = response.json()
-
-        if not batch:
-            break
-
-        collected.extend(batch)
-        oldest_id = batch[-1]["id"]
-
-        if int(oldest_id) <= int(last_message_id):
-            break
-
-        if len(batch) < 100:
-            break
-
-        before_id = oldest_id
-
-    new_messages = [
-        message for message in collected
-        if int(message["id"]) > int(last_message_id)
-    ]
-
-    return sorted(new_messages, key=lambda m: int(m["id"]))
-
-
-# =====================================================
-# PATCHBOT URL
-# =====================================================
-
-def extract_source_url(message):
-    candidates = [message.get("content", "")]
-
-    for embed in message.get("embeds", []):
-        candidates.append(embed.get("url", ""))
-        candidates.append(embed.get("description", ""))
-
-        author = embed.get("author", {})
-        candidates.append(author.get("url", ""))
-
-        for field in embed.get("fields", []):
-            candidates.append(field.get("value", ""))
-            candidates.append(field.get("name", ""))
-
-    for candidate in candidates:
-        if not candidate:
-            continue
-
-        decoded = candidate
-
-        # Discord/PatchBot může používat zakódovaný odkaz.
-        for _ in range(3):
-            decoded = unquote(decoded)
-
-        # Hledáme skutečnou cestu k článku PatchBotu.
-        match = re.search(
-            r"(?:https://patchbot\.io)?"
-            r"(/games/world-of-warcraft-forever/articles/\d+-[A-Za-z0-9-]+)",
-            decoded
-        )
-
-        if match:
-            return "https://patchbot.io" + match.group(1)
-
-        # Přímý odkaz na článek.
-        match = re.search(
-            r"https://patchbot\.io/games/world-of-warcraft-forever/articles/[^\s<>\"']+",
-            decoded
-        )
-
-        if match:
-            return match.group(0).rstrip(").,]}>")
-
-    raise RuntimeError(
-        "Ve zprávě PatchBota nebyl nalezen odkaz na článek."
-    )
-
-
-# =====================================================
-# HTML ARTICLE EXTRACTION
-# =====================================================
-
-class PatchNotesParser(HTMLParser):
-    """
-    Získá obsah článku od hlavního H1 nadpisu
-    po sekci Report a problem.
-    Zachová nadpisy a odrážky.
-    """
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.started = False
-        self.finished = False
-        self.parts = []
-        self.list_depth = 0
-
-    def newline(self):
-        if self.parts and not self.parts[-1].endswith("\n"):
-            self.parts.append("\n")
-
-    def handle_starttag(self, tag, attrs):
-        if self.finished:
-            return
-
-        if tag == "h1":
-            self.started = True
-            self.newline()
-            self.parts.append("# ")
-
-        elif self.started and tag in ("h2", "h3", "h4"):
-            self.newline()
-            level = {"h2": "## ", "h3": "### ", "h4": "#### "}
-            self.parts.append(level[tag])
-
-        elif self.started and tag == "li":
-            self.newline()
-            self.parts.append("- ")
-
-        elif self.started and tag in ("p", "br"):
-            self.newline()
-
-        elif self.started and tag in ("ul", "ol"):
-            self.newline()
-            self.list_depth += 1
-
-    def handle_endtag(self, tag):
-        if self.finished:
-            return
-
-        if self.started and tag in (
-            "h1", "h2", "h3", "h4", "li", "p", "br"
-        ):
-            self.newline()
-
-        if tag in ("ul", "ol") and self.list_depth:
-            self.list_depth -= 1
-
-    def handle_data(self, data):
-        if self.finished or not self.started:
-            return
-
-        text = " ".join(data.split())
-
-        if not text:
-            return
-
-        if text.casefold() == "report a problem":
-            self.finished = True
-            return
-
-        self.parts.append(text + " ")
-
-
-def download_article(source_url):
-    parsed = urlparse(source_url)
-
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname != "patchbot.io"
-        or not parsed.path.startswith(
-            "/games/world-of-warcraft-forever/articles/"
-        )
-    ):
-        raise RuntimeError(
-            f"Neočekávaná adresa článku: {source_url}"
-        )
-
-    print(f"Stahuji celý článek: {source_url}")
-
-    response = session.get(
-        source_url,
-        timeout=45
-    )
-
-    response.raise_for_status()
-
-    final_url = urlparse(response.url)
-
-    if (
-        final_url.scheme != "https"
-        or final_url.hostname != "patchbot.io"
-    ):
-        raise RuntimeError(
-            "Stránka přesměrovala na neočekávanou adresu."
-        )
-
-    parser = PatchNotesParser()
-    parser.feed(response.text)
-    parser.close()
-
-    article_text = "".join(parser.parts)
-
-    article_text = re.sub(r"[ \t]+", " ", article_text)
-    article_text = re.sub(r"\n[ \t]*\n+", "\n", article_text)
-    article_text = article_text.strip()
-
-    if len(article_text) < 200:
-        raise RuntimeError(
-            "Článek se nepodařilo načíst v dostatečném rozsahu."
-        )
-
-    # Očekávané hlavní kategorie tohoto článku.
-    required_sections = [
-        "Classes",
-        "Dungeons",
-        "Enemies and NPCs",
-        "Items",
-        "Professions",
-        "Quests",
-        "User Interface"
-    ]
-
-    missing = [
-        section for section in required_sections
-        if not re.search(
-            rf"^##\s+{re.escape(section)}\s*$",
-            article_text,
-            re.MULTILINE
-        )
-    ]
-
-    if missing:
-        raise RuntimeError(
-            "Článek nemá všechny očekávané sekce: "
-            + ", ".join(missing)
-        )
-
-    bullet_count = len(
-        re.findall(r"(?m)^\s*-\s+", article_text)
-    )
-
-    if bullet_count < 5:
-        raise RuntimeError(
-            "Článek obsahuje podezřele málo odrážek."
-        )
-
-    print(f"Článek načten: {len(article_text)} znaků.")
-    print(f"Počet odrážek: {bullet_count}.")
-    print("Kontrola sedmi sekcí: úspěšná.")
-
-    return article_text, bullet_count
-
-
-# =====================================================
-# GEMINI API
-# =====================================================
-
-def gemini_request(prompt, max_tokens=8192):
-    response = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{GEMINI_MODEL}:generateContent",
-        headers={
-            "x-goog-api-key": GEMINI_KEY,
-            "Content-Type": "application/json"
-        },
-        json={
-            "contents": [
-                {
-                    "parts": [{"text": prompt}]
-                }
-            ],
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-                "temperature": 0.2
-            }
-        },
-        timeout=150
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"Gemini API chyba {response.status_code}: "
-            f"{response.text[:1000]}"
-        )
-
-    data = response.json()
-    candidates = data.get("candidates", [])
-
-    if not candidates:
-        raise RuntimeError("Gemini nevrátil žádný překlad.")
-
-    candidate = candidates[0]
-
-    if candidate.get("finishReason") == "MAX_TOKENS":
-        raise RuntimeError(
-            "Gemini překlad nedokončil kvůli limitu výstupu."
-        )
-
-    parts = candidate.get("content", {}).get("parts", [])
-
-    result = "".join(
-        part.get("text", "")
-        for part in parts
-    ).strip()
-
-    if not result:
-        raise RuntimeError("Gemini vrátil prázdnou odpověď.")
-
-    return result
-
 
 # =====================================================
 # TRANSLATION
@@ -505,6 +89,64 @@ Přibližně 90 % textu musí být přesné informace.
 Maximálně 10 % může tvořit Putricidův humor.
 Nevkládej vtipy do samotných popisů herních změn.
 
+VZTAH K BLIZZARDU:
+
+Professor Putricide považuje Blizzard za svého
+vědeckého konkurenta, jehož experimentální výsledky
+jsou často fascinující, ale poněkud pochybné.
+
+Blizzard je častým terčem jeho inteligentního,
+jízlivého a lehce sarkastického humoru.
+
+PRAVIDLA:
+
+1. Dělej si občas legraci z Blizzardu,
+   jeho vývojářských rozhodnutí, bugů,
+   nečekaných hotfixů a balančních změn.
+
+2. Vystupuj jako vědec, který je přesvědčen,
+   že jeho vlastní experimenty jsou mnohem
+   promyšlenější než některá rozhodnutí Blizzardu.
+
+3. Pokud Blizzard opraví chybu, můžeš poznamenat,
+   že i jejich laboratoř občas vykazuje známky života.
+
+4. Pokud Blizzard něco pokazí, můžeš to označit
+   za zajímavý experiment, který bys ve své
+   laboratoři rozhodně nepovažoval za úspěšný.
+
+5. Používej sarkasmus, ironii a černý humor.
+   Neuchyluj se k vulgárním urážkám.
+
+6. Nedělej si legraci z hráčů ani jejich problémů.
+
+7. Nevymýšlej si kontroverze, chyby ani selhání
+   Blizzardu, které nejsou doložené v patch notes.
+
+8. Blizzard může být terčem vtipů, ale nikdy
+   nesmí být důvodem ke zkreslení herních změn.
+
+9. Nepřeháněj to. Maximálně jedna až dvě
+   krátké poznámky o Blizzardu v jednom příspěvku.
+
+PŘÍKLADY HUMORU:
+
+„Blizzard opět dokázal, že i jednoduchá oprava
+může být fascinujícím experimentem. Gratuluji,
+kolegové. Téměř jste nás překonali!“
+
+„Další hotfix od Blizzardu! Zřejmě si všimli,
+že jejich poslední experiment začal požírat
+vlastní laboratorní personál.“
+
+„Blizzard opravil bug. Výborně! Zdá se,
+že někdo v jejich laboratoři konečně našel
+správnou stranu lektvaru.“
+
+„Zajímavé balanční rozhodnutí, Blizzard.
+Já bych to řešil jinak, ale samozřejmě
+nejsem placený za experimentování s hráči.“
+
 FORMÁT:
 
 Začni přesně:
@@ -512,7 +154,7 @@ Začni přesně:
 
 Na začátku přidej jednu krátkou Putricidovu větu.
 Používej přehledné Discord Markdown nadpisy,
-tučné názvy class a odrážky.
+tučné názvy class a odrážky. A můžeš si rýpnout do blizzardu.
 
 Na konci může být jedna krátká vtipná poznámka
 v Putricidově stylu.
@@ -545,139 +187,6 @@ ORIGINÁLNÍ PATCH NOTES:
         result
     )
 
-    # Kontrola počtu odrážek.
-    actual_bullets = len(
-        re.findall(r"(?m)^\s*[-*]\s+", result)
-    )
-
-    print(
-        f"Kontrola odrážek: zdroj {expected_bullets}, "
-        f"překlad {actual_bullets}."
-    )
-
-    if actual_bullets != expected_bullets:
-        raise RuntimeError(
-            "Počet odrážek v překladu nesouhlasí se zdrojem. "
-            "Zpráva nebyla publikována."
-        )
-
-    return result
-
-
-# =====================================================
-# DISCORD MESSAGE SPLITTING
-# =====================================================
-
-def split_message(text, limit=1900):
-    chunks = []
-
-    while len(text) > limit:
-        split_at = text.rfind("\n", 0, limit)
-
-        if split_at < limit // 2:
-            split_at = text.rfind(" ", 0, limit)
-
-        if split_at <= 0:
-            split_at = limit
-
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip()
-
-    if text:
-        chunks.append(text)
-
-    return chunks
-
-
-# =====================================================
-# PUBLISH TO DISCORD
-# =====================================================
-
-def publish_message(summary, source_url):
-    content = (
-        f"{summary}\n\n"
-        f"🔗 [Originální patch notes]({source_url})"
-    )
-
-    chunks = split_message(content)
-
-    for index, chunk in enumerate(chunks, start=1):
-        discord_request(
-            "POST",
-            f"{DISCORD_API}/channels/{TARGET_CHANNEL}/messages",
-            json={
-                "content": chunk,
-                "allowed_mentions": {"parse": []}
-            }
-        )
-
-        print(f"Odeslána část {index}/{len(chunks)}.")
-
-
-# =====================================================
-# MAIN
-# =====================================================
-
-def main():
-    state = load_state()
-
-    print("🧪 Professor Putricide se probouzí!")
-
-    # První spuštění: uloží aktuální poslední zprávu.
-    if state.get("last_message_id") is None:
-        latest = get_latest_message()
-
-        if latest:
-            state["last_message_id"] = latest["id"]
-            save_state(state)
-
-        print("Výchozí bod uložen.")
-        return
-
-    new_messages = get_new_messages(
-        state["last_message_id"]
-    )
-
-    if not new_messages:
-        print("Žádné nové patch notes.")
-        return
-
-    for message in new_messages:
-        author = message.get("author", {})
-        author_name = author.get("username", "").casefold()
-
-        # Zpracováváme pouze zprávy PatchBota.
-        if not author.get("bot") or "patchbot" not in author_name:
-            state["last_message_id"] = message["id"]
-            save_state(state)
-            continue
-
-        print(f"Zpracovávám zprávu {message['id']}.")
-
-        # 1. Najdeme originální článek.
-        source_url = extract_source_url(message)
-
-        # 2. Stáhneme kompletní článek.
-        original_text, expected_bullets = download_article(source_url)
-
-        # 3. Přeložíme celý obsah.
-        print("Překládám kompletní patch notes...")
-        translation = translate_with_ai(
-            original_text,
-            expected_bullets
-        )
-
-        # 4. Publikujeme.
-        publish_message(translation, source_url)
-
-        # 5. Uložíme stav až po úspěšném publikování.
-        state["last_message_id"] = message["id"]
-        save_state(state)
-
-        print("GOOD NEWS, EVERYONE! Publikováno.")
-
-    print("Kontrola dokončena.")
-
-
-if __name__ == "__main__":
-    main()
+    # Bezpečnostní kontrola rozsahu překladu.
+    # Přesný počet markdown odrážek není spolehlivý: model může
+    # legitimně změnit vnoření seznamů nebo rozdělení řádků.
