@@ -2,11 +2,10 @@
 import os
 import re
 import json
-import sys
 import time
 import requests
 from html.parser import HTMLParser
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 # =====================================================
 # KONFIGURACE
@@ -132,7 +131,6 @@ def extract_source_url(message):
 
     for candidate in matches:
         candidate = candidate.rstrip(".,);]}>")
-
         parsed = urlparse(candidate)
 
         if parsed.netloc.lower().endswith("patchbot.io"):
@@ -146,6 +144,7 @@ def extract_source_url(message):
 # =====================================================
 
 class ArticleParser(HTMLParser):
+
     BLOCK_TAGS = {
         "p", "div", "section", "article",
         "h1", "h2", "h3", "h4",
@@ -161,12 +160,13 @@ class ArticleParser(HTMLParser):
         super().__init__()
         self.lines = []
         self.skip_depth = 0
-        self.list_depth = 0
         self.current_line = []
         self.started = False
 
     def flush_line(self):
-        text = " ".join("".join(self.current_line).split()).strip()
+        text = " ".join(
+            "".join(self.current_line).split()
+        ).strip()
 
         if text:
             self.lines.append(text)
@@ -190,9 +190,6 @@ class ArticleParser(HTMLParser):
         if tag in self.BLOCK_TAGS:
             self.flush_line()
 
-        if tag in ("ul", "ol"):
-            self.list_depth += 1
-
         if tag == "li":
             self.flush_line()
             self.current_line.append("• ")
@@ -207,9 +204,6 @@ class ArticleParser(HTMLParser):
 
         if tag in self.BLOCK_TAGS:
             self.flush_line()
-
-        if tag in ("ul", "ol"):
-            self.list_depth = max(0, self.list_depth - 1)
 
     def handle_data(self, data):
         if self.skip_depth or not self.started:
@@ -234,7 +228,9 @@ def download_article(article_url):
     response = SESSION.get(
         article_url,
         timeout=45,
-        headers={"User-Agent": "Mozilla/5.0 ProfessorPutricide/1.0"}
+        headers={
+            "User-Agent": "Mozilla/5.0 ProfessorPutricide/1.0"
+        }
     )
 
     if response.status_code != 200:
@@ -260,7 +256,6 @@ def download_article(article_url):
         )[0].strip()
 
     log(f"Staženo znaků článku: {len(article_text)}")
-
     log("Začátek extrahovaného článku:")
     log(article_text[:500])
 
@@ -314,8 +309,8 @@ def gemini_request(prompt, max_tokens=8192):
 
     except (KeyError, IndexError, TypeError):
         raise RuntimeError(
-            f"Gemini vrátil neočekávanou odpověď: "
-            f"{json.dumps(data, ensure_ascii=False)[:2000]}"
+            "Gemini vrátil neočekávanou odpověď: "
+            + json.dumps(data, ensure_ascii=False)[:2000]
         )
 
     if not result:
@@ -329,6 +324,7 @@ def gemini_request(prompt, max_tokens=8192):
 # =====================================================
 
 def translate_with_ai(original_text):
+
     prompt = f"""
 Jsi Professor Putricide ze světa World of Warcraft.
 Připravuješ české patch notes pro World of Warcraft: Forever.
@@ -440,10 +436,10 @@ ORIGINÁLNÍ PATCH NOTES:
 
 
 # =====================================================
-# ODESLÁNÍ DO DISCORDU
+# ROZDĚLENÍ ZPRÁV PRO DISCORD
 # =====================================================
 
-def split_message(text, limit=1900):
+def split_message(text, limit=1800):
     chunks = []
 
     while len(text) > limit:
@@ -464,14 +460,32 @@ def split_message(text, limit=1900):
     return chunks
 
 
-def send_to_discord(text, source_url):
-    chunks = split_message(text)
+# =====================================================
+# ODESLÁNÍ DO DISCORDU
+# =====================================================
 
-    log(f"Odesílám překlad do Discordu. Částí: {len(chunks)}")
+def send_to_discord(text, source_url):
+
+    # Odkaz připojíme ještě před rozdělením.
+    full_text = (
+        text
+        + f"\n\n🔗 [Původní článek PatchBot]({source_url})"
+    )
+
+    # Každá část bude mít maximálně 1800 znaků.
+    chunks = split_message(full_text, limit=1800)
+
+    log(
+        f"Celkový překlad: {len(full_text)} znaků. "
+        f"Odesílám {len(chunks)} zpráv."
+    )
 
     for index, chunk in enumerate(chunks):
-        if index == 0:
-            chunk += f"\n\n🔗 [Původní článek PatchBot]({source_url})"
+
+        log(
+            f"Odesílám část {index + 1}/{len(chunks)} "
+            f"({len(chunk)} znaků)."
+        )
 
         response = SESSION.post(
             f"{DISCORD_API}/channels/{TARGET_CHANNEL_ID}/messages",
@@ -485,15 +499,15 @@ def send_to_discord(text, source_url):
 
         if response.status_code not in (200, 201):
             raise RuntimeError(
-                f"Discord neodeslal zprávu: "
+                f"Discord odmítl část {index + 1}: "
                 f"{response.status_code} - {response.text[:1000]}"
             )
 
-        log(f"Odeslána část {index + 1}/{len(chunks)}")
-
         time.sleep(1)
 
-    log("Překlad byl úspěšně odeslán.")
+    log(
+        f"Úspěšně odesláno všech {len(chunks)} částí."
+    )
 
 
 # =====================================================
@@ -501,6 +515,7 @@ def send_to_discord(text, source_url):
 # =====================================================
 
 def main():
+
     log("========================================")
     log("Professor Putricide se probouzí...")
     log("========================================")
@@ -516,19 +531,21 @@ def main():
         log("Žádné nové zprávy.")
         return
 
-    latest_message_id = last_message_id
-
     for message in messages:
+
         message_id = message["id"]
-        latest_message_id = message_id
 
         log(f"Kontroluji zprávu ID: {message_id}")
 
         article_url = extract_source_url(message)
 
         if not article_url:
-            log("Zpráva neobsahuje odkaz na PatchBot. Přeskakuji.")
-            save_state(latest_message_id)
+            log(
+                "Zpráva neobsahuje odkaz na PatchBot. "
+                "Přeskakuji."
+            )
+
+            save_state(message_id)
             continue
 
         log(f"Nalezen PatchBot článek: {article_url}")
@@ -537,8 +554,10 @@ def main():
 
         translated_text = translate_with_ai(original_text)
 
+        # Nejdříve odešleme všechny části.
         send_to_discord(translated_text, article_url)
 
+        # ID uložíme až po úspěšném odeslání.
         save_state(message_id)
 
         log(f"Zpráva {message_id} byla úspěšně zpracována.")
@@ -549,7 +568,12 @@ def main():
     log("========================================")
 
 
+# =====================================================
+# SPUŠTĚNÍ
+# =====================================================
+
 if __name__ == "__main__":
+
     try:
         main()
 
